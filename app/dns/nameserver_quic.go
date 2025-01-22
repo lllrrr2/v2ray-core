@@ -1,15 +1,15 @@
 package dns
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"net/url"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/lucas-clemente/quic-go"
+	"github.com/quic-go/quic-go"
 	"golang.org/x/net/dns/dnsmessage"
-	"golang.org/x/net/http2"
 
 	"github.com/v2fly/v2ray-core/v5/common"
 	"github.com/v2fly/v2ray-core/v5/common/buf"
@@ -23,8 +23,8 @@ import (
 )
 
 // NextProtoDQ - During connection establishment, DNS/QUIC support is indicated
-// by selecting the ALPN token "dq" in the crypto handshake.
-const NextProtoDQ = "doq-i00"
+// by selecting the ALPN token "doq" in the crypto handshake.
+const NextProtoDQ = "doq"
 
 const handshakeIdleTimeout = time.Second * 8
 
@@ -34,7 +34,6 @@ type QUICNameServer struct {
 	ips         map[string]record
 	pub         *pubsub.Service
 	cleanup     *task.Periodic
-	reqID       uint32
 	name        string
 	destination net.Destination
 	connection  quic.Connection
@@ -45,7 +44,7 @@ func NewQUICNameServer(url *url.URL) (*QUICNameServer, error) {
 	newError("DNS: created Local DNS-over-QUIC client for ", url.String()).AtInfo().WriteToLog()
 
 	var err error
-	port := net.Port(784)
+	port := net.Port(853)
 	if url.Port() != "" {
 		port, err = net.PortFromString(url.Port())
 		if err != nil {
@@ -148,7 +147,7 @@ func (s *QUICNameServer) updateIP(req *dnsRequest, ipRec *IPRecord) {
 }
 
 func (s *QUICNameServer) newReqID() uint16 {
-	return uint16(atomic.AddUint32(&s.reqID, 1))
+	return 0
 }
 
 func (s *QUICNameServer) sendQuery(ctx context.Context, domain string, clientIP net.IP, option dns_feature.IPOption) {
@@ -189,13 +188,18 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, domain string, clientIP 
 				return
 			}
 
+			dnsReqBuf := buf.New()
+			binary.Write(dnsReqBuf, binary.BigEndian, uint16(b.Len()))
+			dnsReqBuf.Write(b.Bytes())
+			b.Release()
+
 			conn, err := s.openStream(dnsCtx)
 			if err != nil {
 				newError("failed to open quic connection").Base(err).AtError().WriteToLog()
 				return
 			}
 
-			_, err = conn.Write(b.Bytes())
+			_, err = conn.Write(dnsReqBuf.Bytes())
 			if err != nil {
 				newError("failed to send query").Base(err).AtError().WriteToLog()
 				return
@@ -205,9 +209,21 @@ func (s *QUICNameServer) sendQuery(ctx context.Context, domain string, clientIP 
 
 			respBuf := buf.New()
 			defer respBuf.Release()
-			n, err := respBuf.ReadFrom(conn)
+			n, err := respBuf.ReadFullFrom(conn, 2)
 			if err != nil && n == 0 {
-				newError("failed to read response").Base(err).AtError().WriteToLog()
+				newError("failed to read response length").Base(err).AtError().WriteToLog()
+				return
+			}
+			var length int16
+			err = binary.Read(bytes.NewReader(respBuf.Bytes()), binary.BigEndian, &length)
+			if err != nil {
+				newError("failed to parse response length").Base(err).AtError().WriteToLog()
+				return
+			}
+			respBuf.Clear()
+			n, err = respBuf.ReadFullFrom(conn, int32(length))
+			if err != nil && n == 0 {
+				newError("failed to read response length").Base(err).AtError().WriteToLog()
 				return
 			}
 
@@ -359,12 +375,23 @@ func (s *QUICNameServer) getConnection(ctx context.Context) (quic.Connection, er
 }
 
 func (s *QUICNameServer) openConnection(ctx context.Context) (quic.Connection, error) {
-	tlsConfig := tls.Config{}
+	tlsConfig := tls.Config{
+		ServerName: func() string {
+			switch s.destination.Address.Family() {
+			case net.AddressFamilyIPv4, net.AddressFamilyIPv6:
+				return s.destination.Address.IP().String()
+			case net.AddressFamilyDomain:
+				return s.destination.Address.Domain()
+			default:
+				panic("unknown address family")
+			}
+		}(),
+	}
 	quicConfig := &quic.Config{
 		HandshakeIdleTimeout: handshakeIdleTimeout,
 	}
 
-	conn, err := quic.DialAddrContext(ctx, s.destination.NetAddr(), tlsConfig.GetTLSConfig(tls.WithNextProto("http/1.1", http2.NextProtoTLS, NextProtoDQ)), quicConfig)
+	conn, err := quic.DialAddr(ctx, s.destination.NetAddr(), tlsConfig.GetTLSConfig(tls.WithNextProto(NextProtoDQ)), quicConfig)
 	if err != nil {
 		return nil, err
 	}

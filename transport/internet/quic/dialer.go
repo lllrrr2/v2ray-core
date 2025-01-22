@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/lucas-clemente/quic-go"
+	"github.com/quic-go/quic-go"
 
 	"github.com/v2fly/v2ray-core/v5/common"
 	"github.com/v2fly/v2ray-core/v5/common/net"
@@ -150,10 +150,9 @@ func (s *clientConnections) openConnection(destAddr net.Addr, config *Config, tl
 	}
 
 	quicConfig := &quic.Config{
-		ConnectionIDLength:   12,
 		HandshakeIdleTimeout: time.Second * 8,
 		MaxIdleTimeout:       time.Second * 30,
-		KeepAlive:            true,
+		KeepAlivePeriod:      time.Second * 15,
 	}
 
 	sysConn, err := wrapSysConn(rawConn.(*net.UDPConn), config)
@@ -162,7 +161,12 @@ func (s *clientConnections) openConnection(destAddr net.Addr, config *Config, tl
 		return nil, err
 	}
 
-	conn, err := quic.DialContext(context.Background(), sysConn, destAddr, "", tlsConfig.GetTLSConfig(tls.WithDestination(dest)), quicConfig)
+	tr := quic.Transport{
+		Conn:               sysConn,
+		ConnectionIDLength: 12,
+	}
+
+	conn, err := tr.Dial(context.Background(), destAddr, tlsConfig.GetTLSConfig(tls.WithDestination(dest)), quicConfig)
 	if err != nil {
 		sysConn.Close()
 		return nil, err
